@@ -250,17 +250,17 @@ class PdfFileWriter(object):
 
         :param str fname: The filename to display.
         :param str fdata: The data in the file.
-      
+
         Reference:
         https://www.adobe.com/content/dam/Adobe/en/devnet/acrobat/pdfs/PDF32000_2008.pdf
         Section 7.11.3
         """
-        
+
         # We need 3 entries:
         # * The file's data
         # * The /Filespec entry
         # * The file's name, which goes in the Catalog
-        
+
 
         # The entry for the file
         """ Sample:
@@ -272,7 +272,7 @@ class PdfFileWriter(object):
         stream
         Hello world!
         endstream
-        endobj        
+        endobj
         """
         file_entry = DecodedStreamObject()
         file_entry.setData(fdata)
@@ -291,14 +291,14 @@ class PdfFileWriter(object):
         """
         efEntry = DictionaryObject()
         efEntry.update({ NameObject("/F"):file_entry })
-        
+
         filespec = DictionaryObject()
         filespec.update({
                 NameObject("/Type"): NameObject("/Filespec"),
                 NameObject("/F"): createStringObject(fname),  # Perhaps also try TextStringObject
                 NameObject("/EF"): efEntry
                 })
-                
+
         # Then create the entry for the root, as it needs a reference to the Filespec
         """ Sample:
         1 0 obj
@@ -309,13 +309,13 @@ class PdfFileWriter(object):
          /Names << /EmbeddedFiles << /Names [(hello.txt) 7 0 R] >> >>
         >>
         endobj
-        
+
         """
         embeddedFilesNamesDictionary = DictionaryObject()
         embeddedFilesNamesDictionary.update({
                 NameObject("/Names"): ArrayObject([createStringObject(fname), filespec])
                 })
-        
+
         embeddedFilesDictionary = DictionaryObject()
         embeddedFilesDictionary.update({
                 NameObject("/EmbeddedFiles"): embeddedFilesNamesDictionary
@@ -329,7 +329,7 @@ class PdfFileWriter(object):
         """
         Copy pages from reader to writer. Includes an optional callback parameter
         which is invoked after pages are appended to the writer.
-        
+
         :param reader: a PdfFileReader object from which to copy page
             annotations to this writer object.  The writer's annots
         will then be updated
@@ -373,7 +373,7 @@ class PdfFileWriter(object):
     def cloneReaderDocumentRoot(self, reader):
         '''
         Copy the reader document root to the writer.
-        
+
         :param reader:  PdfFileReader from the document root should be copied.
         :callback after_page_append
         '''
@@ -2188,6 +2188,14 @@ class PageObject(DictionaryObject):
         return stream
     _pushPopGS = staticmethod(_pushPopGS)
 
+    def _addCode(contents, pdf, code, endCode = ""):
+
+        stream = ContentStream(contents, pdf)
+        stream.operations.insert(0, [[], code])
+        stream.operations.append([[], endCode])
+        return stream
+    _addCode = staticmethod(_addCode)
+
     def _addTransformationMatrix(contents, pdf, ctm):
         # adds transformation matrix at the beginning of the given
         # contents stream.
@@ -2297,6 +2305,97 @@ class PageObject(DictionaryObject):
         self[NameObject('/Contents')] = ContentStream(newContentArray, self.pdf)
         self[NameObject('/Resources')] = newResources
         self[NameObject('/Annots')] = newAnnots
+
+
+    # Variant of the mergePage function.
+    # Merges the content streams of several pages and code strings into one page.
+    # Resource references (i.e. fonts) are maintained from all pages.
+    # The parameter ar_data is an array containing code strings and PageObjects.
+    # ContentStream is called only if necessary because it calls ParseContentStream
+    # which is slox. Otherwise the Content is directly extracted and added to the code.
+
+    def mergePage2(self, ar_data ):
+
+        newResources = DictionaryObject()
+        rename = {}
+        originalResources = self["/Resources"].getObject()
+        code_s = b""
+
+        if isinstance(ar_data, PageObject) :
+            ar_data = [ar_data]
+        for data in ar_data :
+            if isinstance(data, str) :
+                if sys.version[0:1] == "2" :
+                    data = bytes(data)
+                elif sys.version[0:1] == "3" :
+                    data = bytes(data, "utf-8")
+            if isinstance(data, PageObject) :
+
+                # Now we work on merging the resource dictionaries.  This allows us
+                # to find out what symbols in the content streams we might need to
+                # rename.
+                pagexResources = data["/Resources"].getObject()
+
+                for res in "/ExtGState", "/Font", "/XObject", "/ColorSpace", "/Pattern", "/Shading":
+                    new, newrename = PageObject._mergeResources(originalResources, pagexResources, res)
+                    if new:
+                        newResources[NameObject(res)] = new
+                        rename.update(newrename)
+
+                # Combine /Resources sets.
+                originalResources.update(newResources)
+
+                # Combine /ProcSet sets.
+                newResources[NameObject("/ProcSet")] = ArrayObject(
+                    frozenset(originalResources.get("/ProcSet", ArrayObject()).getObject()).union(
+                        frozenset(pagexResources.get("/ProcSet", ArrayObject()).getObject())
+                    )
+                )
+
+                if len(rename) > 0 :
+                    pagexContent = data['/Contents'].getObject()
+                    pagexContent = PageObject._contentStreamRename(pagexContent, rename, self.pdf)
+                    code_s += pagexContent.getData() + b"\n"
+                else :
+                    page_keys = data.keys()
+                    if "/Contents" in page_keys :            # if page is not blank
+                        data1 =self.extractContent(data["/Contents"])
+                        code_s +=  data1 + b"\n"
+
+
+            else :
+                code_s += data + b"\n"
+
+
+        originalContent = self["/Contents"].getObject()
+        outputContent = PageObject._addCode(originalContent, self.pdf, code_s)
+
+        self[NameObject('/Contents')] = outputContent
+        self[NameObject('/Resources')] = originalResources
+
+
+    def extractContent(self,data) :
+        code_s = b""
+        pageContent = data.getObject()
+        if isinstance(pageContent, ArrayObject) :
+            for data2 in pageContent :
+                code_s += self.extractContent(data2)
+        else :
+            if isinstance(data, TextStringObject) :
+                code_s += data
+            else :
+                try :
+                    decodedData = filters.decodeStreamData(pageContent)
+                    code_s += decodedData
+                except :
+                    print ("le code n'a pas pu etre extrait")
+
+        return code_s
+
+    def mergeModifiedPage(self, page2, code, endCode = ""):
+        self._mergePage(page2, lambda page2Content:
+            PageObject._addCode(page2Content, page2.pdf, code, endCode), code)
+
 
     def mergeTransformedPage(self, page2, ctm, expand=False):
         """
